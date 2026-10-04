@@ -8,18 +8,24 @@ from backend.app.tools.system_tools import (
 from backend.app.tools.desktop_tools import (
     ScreenshotTool, WindowManagementTool
 )
-from backend.app.tools.browser_tools import (
-    SearchWebTool, ReadPageTool
+from backend.app.tools.desktop_control_tools import (
+    LaunchApplicationTool, FocusWindowTool, MouseClickTool, KeyboardTypeTool
+)
+from backend.app.tools.real_browser_tools import (
+    RealWebSearchTool, RealWebScraperTool
 )
 from backend.app.tools.vision_tools import (
     AnalyzeScreenTool
 )
 from backend.app.tools.content_tools import (
-    GenerateContentTool, RenderDiagramTool, CreateWordDocumentTool, VerifyFileOutputTool, VerifyResultsTool
+    GenerateContentTool, RenderDiagramTool, VerifyFileOutputTool, VerifyResultsTool
+)
+from backend.app.tools.document_engine_tools import (
+    CreateRealWordProjectDocumentTool
 )
 
 def register_default_tools():
-    """Register all standard built-in tools."""
+    """Register all standard built-in and advanced tools."""
     tools_to_register = [
         # File tools
         ListFilesTool(),
@@ -28,22 +34,26 @@ def register_default_tools():
         WriteFileTool(),
         CreateFolderTool(),
         MoveFileTool(),
-        # System tools
+        # System & Shell tools
         GetSystemInfoTool(),
         ListProcessesTool(),
         ExecuteCommandTool(),
-        # Desktop tools
+        # Windows & Desktop Control tools
         ScreenshotTool(),
         WindowManagementTool(),
-        # Browser tools
-        SearchWebTool(),
-        ReadPageTool(),
+        LaunchApplicationTool(),
+        FocusWindowTool(),
+        MouseClickTool(),
+        KeyboardTypeTool(),
+        # Real Browser & Web Scraping tools
+        RealWebSearchTool(),
+        RealWebScraperTool(),
         # Vision tools
         AnalyzeScreenTool(),
-        # Content, Document, and QA tools
+        # Real Document, Diagram & QA verification tools
         GenerateContentTool(),
         RenderDiagramTool(),
-        CreateWordDocumentTool(),
+        CreateRealWordProjectDocumentTool(),
         VerifyFileOutputTool(),
         VerifyResultsTool(),
     ]

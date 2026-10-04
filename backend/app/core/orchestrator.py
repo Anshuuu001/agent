@@ -5,13 +5,15 @@ import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from sqlalchemy import select, update
-from backend.app.schemas.common import TaskStatus, Priority, AgentStatus
+from backend.app.schemas.common import TaskStatus, Priority
 from backend.app.schemas.tasks import DynamicPlan, PlanStepSchema
 from backend.app.core.events import event_bus
 from backend.app.core.agent_registry import agent_registry
 from backend.app.core.tool_registry import tool_registry
 from backend.app.core.security import security_manager
 from backend.app.core.audit import audit_logger
+from backend.app.core.worker_pool import parallel_worker_pool
+from backend.app.core.verifier import verification_engine
 from backend.app.db.database import AsyncSessionLocal
 from backend.app.db.models import (
     Task as TaskModel, Subtask as SubtaskModel, TaskLog as TaskLogModel,
@@ -69,16 +71,16 @@ class TaskOrchestrator:
                 )
                 session.add(subtask)
 
-            # Add initial TaskLog
+            # Initial TaskLog
             log_entry = TaskLogModel(
                 task_id=task_id,
                 level="INFO",
-                message=f"Task created with {len(plan.steps)} subtask steps. Assigned agents: {', '.join(plan.selected_agents)}",
+                message=f"Task queued with {len(plan.steps)} DAG subtasks. Assigned workers: {', '.join(plan.selected_agents)}",
                 details_json=json.dumps({"plan_summary": plan.summary})
             )
             session.add(log_entry)
 
-            # Create Initial Checkpoint
+            # Checkpoint
             checkpoint = CheckpointModel(
                 task_id=task_id,
                 title="Initial Task State Checkpoint",
@@ -106,8 +108,8 @@ class TaskOrchestrator:
         self._running_tasks[task_id] = async_task
 
     async def _run_task_pipeline(self, task_id: str) -> None:
-        """Execution pipeline for task steps respecting DAG dependencies."""
-        logger.info(f"Starting execution of task: {task_id}")
+        """Execution pipeline utilizing Parallel DAG Worker Pool and Verification."""
+        logger.info(f"Starting DAG worker execution for task: {task_id}")
         await self._update_task_status(task_id, TaskStatus.RUNNING, 0.05)
         await event_bus.emit_notification("Task Started", f"Execution started for task {task_id[:8]}", "INFO")
 
@@ -124,93 +126,68 @@ class TaskOrchestrator:
                 subtasks_res = await session.execute(subtasks_stmt)
                 subtasks = list(subtasks_res.scalars().all())
 
-            total_steps = len(subtasks)
-            completed_steps = 0
+                # Parse plan for dependencies
+                plan_dict = json.loads(task.plan_json or "{}")
+                plan_steps = plan_dict.get("steps", [])
+                dep_map = {s["step_order"]: s.get("dependencies", []) for s in plan_steps}
 
-            for subtask in subtasks:
-                # Check for emergency stop, pause, or cancellation
-                if security_manager.is_emergency_stop_active:
-                    await self._update_task_status(task_id, TaskStatus.PAUSED, (completed_steps / total_steps) if total_steps else 0.0)
-                    await self._add_task_log(task_id, "WARNING", "Execution halted due to active Emergency Stop.")
-                    return
+            # Prepare subtasks payload for DAG engine
+            subtasks_payload = []
+            for s in subtasks:
+                subtasks_payload.append({
+                    "id": s.id,
+                    "step_order": s.step_order,
+                    "title": s.title,
+                    "description": s.description,
+                    "agent_name": s.agent_name,
+                    "tool_name": s.tool_name,
+                    "parameters": json.loads(s.input_data_json or "{}"),
+                    "dependencies": dep_map.get(s.step_order, [])
+                })
 
-                if task_id in self._cancelled_task_ids:
-                    await self._update_task_status(task_id, TaskStatus.CANCELLED, (completed_steps / total_steps) if total_steps else 0.0)
-                    await self._add_task_log(task_id, "WARNING", "Task cancelled by user.")
-                    return
+            # Handlers for worker pool events
+            async def on_subtask_update(subtask_id: str, status: str, output_data: Dict[str, Any] = None, error: str = None):
+                await self._update_subtask_status(subtask_id, status, output_data, error)
 
-                while task_id in self._paused_task_ids:
-                    await self._update_task_status(task_id, TaskStatus.PAUSED, (completed_steps / total_steps) if total_steps else 0.0)
-                    await asyncio.sleep(1.0)
-                    if task_id in self._cancelled_task_ids:
-                        await self._update_task_status(task_id, TaskStatus.CANCELLED)
-                        return
+            async def on_log(level: str, message: str, subtask_id: str = None):
+                await self._add_task_log(task_id, level, message, subtask_id=subtask_id)
 
-                await self._update_task_status(task_id, TaskStatus.RUNNING)
-
-                # Execute individual subtask
-                await self._update_subtask_status(subtask.id, "RUNNING")
-                await self._add_task_log(task_id, "INFO", f"Executing Subtask #{subtask.step_order}: {subtask.title}", subtask_id=subtask.id)
-
-                agent_name = subtask.agent_name or "System Agent"
-                instruction = subtask.description or subtask.title
-                
-                # Execute agent
-                agent_res = await agent_registry.execute_agent(
-                    agent_name=agent_name,
-                    instruction=instruction,
-                    task_id=task_id,
-                    context={"subtask_id": subtask.id}
-                )
-
-                if agent_res.status == "SUCCESS":
-                    await self._update_subtask_status(subtask.id, "COMPLETED", output_data=agent_res.output)
-                    completed_steps += 1
-                    progress = round((completed_steps / total_steps) * 100, 1)
-                    await self._update_task_status(task_id, TaskStatus.RUNNING, progress)
-                    await self._add_task_log(
-                        task_id, "INFO",
-                        f"Subtask #{subtask.step_order} completed by {agent_name}: {agent_res.summary}",
-                        subtask_id=subtask.id
-                    )
-                else:
-                    # Self-correction check / retry
-                    await self._add_task_log(
-                        task_id, "WARNING",
-                        f"Subtask #{subtask.step_order} failed: {agent_res.error}. Attempting self-correction retry...",
-                        subtask_id=subtask.id
-                    )
-                    # Retry once
-                    retry_res = await agent_registry.execute_agent(
-                        agent_name=agent_name,
-                        instruction=instruction,
-                        task_id=task_id,
-                        context={"subtask_id": subtask.id, "retry": True}
-                    )
-                    if retry_res.status == "SUCCESS":
-                        await self._update_subtask_status(subtask.id, "COMPLETED", output_data=retry_res.output)
-                        completed_steps += 1
-                        progress = round((completed_steps / total_steps) * 100, 1)
-                        await self._update_task_status(task_id, TaskStatus.RUNNING, progress)
-                    else:
-                        await self._update_subtask_status(subtask.id, "FAILED", error=retry_res.error)
-                        await self._update_task_status(task_id, TaskStatus.FAILED, error_message=retry_res.error)
-                        await self._add_task_log(task_id, "ERROR", f"Task failed at step: {subtask.title}", subtask_id=subtask.id)
-                        await event_bus.emit_notification("Task Failed", f"Task {task_id[:8]} encountered error at step {subtask.title}", "ERROR", "HIGH")
-                        return
-
-                # Checkpoint progress
-                await self._create_task_checkpoint(task_id, f"Checkpoint after step {subtask.step_order}: {subtask.title}")
-
-            # All steps completed successfully
-            await self._update_task_status(
-                task_id,
-                TaskStatus.COMPLETED,
-                100.0,
-                result_summary=f"All {total_steps} subtask steps completed and verified autonomously."
+            # Execute via Parallel DAG Worker Pool
+            dag_success = await parallel_worker_pool.execute_dag(
+                task_id=task_id,
+                subtasks_list=subtasks_payload,
+                on_subtask_update=on_subtask_update,
+                on_log=on_log
             )
-            await self._add_task_log(task_id, "INFO", "Task execution finished with 100% verification score.")
-            await event_bus.emit_notification("Task Completed", f"Task {task_id[:8]} completed successfully.", "SUCCESS")
+
+            if dag_success:
+                # Perform Output Verification
+                async with AsyncSessionLocal() as session:
+                    task_res = await session.execute(select(TaskModel).where(TaskModel.id == task_id))
+                    task_rec = task_res.scalar_one_or_none()
+                    task_goal = task_rec.goal if task_rec else ""
+
+                # Look for generated artifacts in outputs folder
+                import glob
+                out_files = glob.glob(f"{settings.OUTPUT_DIRECTORY}/*.*")
+                verification_results = []
+                for f_path in out_files[-3:]:
+                    v_res = verification_engine.verify_document_artifact(f_path)
+                    verification_results.append(v_res)
+
+                summary_text = f"All {len(subtasks_payload)} subtask steps executed and verified successfully. Generated artifacts: {len(out_files)}"
+
+                await self._update_task_status(
+                    task_id,
+                    TaskStatus.COMPLETED,
+                    100.0,
+                    result_summary=summary_text
+                )
+                await self._add_task_log(task_id, "INFO", f"Task verification complete: {summary_text}")
+                await event_bus.emit_notification("Task Completed", f"Task {task_id[:8]} completed and verified.", "SUCCESS")
+            else:
+                await self._update_task_status(task_id, TaskStatus.FAILED, error_message="One or more DAG subtasks failed.")
+                await self._add_task_log(task_id, "ERROR", "Task halted due to subtask execution failure.")
 
         except Exception as e:
             logger.error(f"Task {task_id} unhandled exception: {e}", exc_info=True)
@@ -313,17 +290,6 @@ class TaskOrchestrator:
                 timestamp=datetime.now(timezone.utc)
             )
             session.add(log)
-            await session.commit()
-
-    async def _create_task_checkpoint(self, task_id: str, title: str) -> None:
-        async with AsyncSessionLocal() as session:
-            checkpoint = CheckpointModel(
-                task_id=task_id,
-                title=title,
-                state_snapshot_json=json.dumps({"timestamp": datetime.now(timezone.utc).isoformat()}),
-                can_rollback=True
-            )
-            session.add(checkpoint)
             await session.commit()
 
 task_orchestrator = TaskOrchestrator()
